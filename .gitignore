@@ -37,3 +37,7 @@ venv/
 # ChromaDB local data
 *.sqlite3-journal
 .envrc
+
+# ChunkHound index (DB lives in ~/workbench/chunkhound-dbs)
+.chunkhound
+.chunkhound.json
