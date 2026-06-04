@@ -41,3 +41,5 @@ venv/
 # ChunkHound index (DB lives in ~/workbench/chunkhound-dbs)
 .chunkhound
 .chunkhound.json
+
+.review-logs

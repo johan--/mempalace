@@ -15,15 +15,18 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _metadata_matches_extract_mode,
+    _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     prefetch_mined_set,
 )
 
@@ -450,6 +453,60 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
     return drawers_added, room_counts_delta, False
 
 
+def _is_ai_tool_path(path: Path) -> bool:
+    """Return True when `path` lives inside a known AI-tool storage dir.
+
+    Detected paths (exact-segment match — substrings like `.gemini-backup`
+    or `.codex-archive` do NOT match):
+      - any segment ``.codex`` (Codex CLI sessions / archives)
+      - any segment ``.gemini`` (Gemini CLI sessions under ~/.gemini/tmp/...)
+      - the consecutive segment pair ``.claude/projects`` (Claude Code).
+        ``.claude`` alone is NOT matched — that is the settings/config dir,
+        not a conversation source.
+
+    Used by ``_resolve_wing`` to default the destination wing to
+    ``wing_api`` when the user hasn't passed an explicit ``--wing``.
+    """
+    try:
+        parts = path.resolve().parts
+    except (OSError, RuntimeError):
+        return False
+
+    if ".codex" in parts:
+        return True
+    if ".gemini" in parts:
+        return True
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return True
+    return False
+
+
+def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
+    """Determine the destination wing for ``mine_convos``.
+
+    Precedence (first match wins):
+
+      1. Explicit ``wing`` argument from the user — always wins, even on
+         an AI-tool path. Empty string is treated as "no wing".
+      2. AI-tool path detection — defaults to ``wing_api`` so Claude
+         Code / Codex / Gemini conversations group under a single wing
+         dedicated to API-sourced content.
+      3. Basename fallback — sanitized via ``config.normalize_wing_name``
+         (lowercase, spaces/hyphens collapsed to underscores). Shared
+         single source of truth with ``cmd_init``,
+         ``room_detector_local``, and ``miner.load_config`` so all
+         wing-slug producers stay in sync (per #1194 consolidation).
+    """
+    from .config import normalize_wing_name
+
+    if wing:
+        return wing
+    if _is_ai_tool_path(convo_path):
+        return "wing_api"
+    return normalize_wing_name(convo_path.name)
+
+
 def mine_convos(
     convo_dir: str,
     palace_path: str,
@@ -465,14 +522,54 @@ def mine_convos(
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
 
+    The real work is in :func:`_mine_convos_impl`; this wrapper holds the
+    per-palace flock around it so two concurrent ``mempalace mine --mode
+    convos`` invocations against the same palace can't pile up. This
+    mirrors the pattern in :func:`mempalace.miner.mine`. The lock is
+    non-blocking: ``MineAlreadyRunning`` propagates to the CLI (which
+    renders a holder-aware message and exits non-zero) or to in-process
+    callers that expect to coexist with another writer.
+
+    Dry-run skips the lock — it never writes to the palace and so cannot
+    corrupt anything, and skipping the lock lets dry-run probes coexist
+    with a live mine.
+
     Chunking parameters (chunk_size, min_chunk_size) are read from
-    MempalaceConfig so `config.json` governs both this path and the
-    project-file miner in `miner.py`. `min_chunk_size` preserves
-    convo_miner's lower default (30 — more permissive than the 50-char
-    project default, so short conversation exchanges are not dropped)
-    when not explicitly set in config.json, so a user who never touches
-    chunking keeps the existing behavior.
+    MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
+    governs both this path and the project-file miner in `miner.py`.
     """
+    if dry_run:
+        return _mine_convos_impl(
+            convo_dir,
+            palace_path,
+            wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract_mode=extract_mode,
+        )
+
+    with mine_palace_lock(palace_path):
+        return _mine_convos_impl(
+            convo_dir,
+            palace_path,
+            wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract_mode=extract_mode,
+        )
+
+
+def _mine_convos_impl(
+    convo_dir: str,
+    palace_path: str,
+    wing: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    extract_mode: str = "exchange",
+):
     from .config import MempalaceConfig
 
     palace_config = MempalaceConfig()
@@ -482,17 +579,14 @@ def mine_convos(
     # validated value or None — None keeps convo's lower 30-char floor
     # (more permissive than the 50-char project default, so short
     # exchanges aren't dropped). Using the validated accessor (not raw
-    # _file_config) means a
-    # garbage/negative/bool config value can't TypeError the length gate
-    # below or ValueError out of chunk_exchanges and abort convo ingest.
+    # _file_config) means a garbage/negative/bool config value can't
+    # TypeError the length gate below or ValueError out of
+    # chunk_exchanges and abort convo ingest.
     explicit_min = palace_config.min_chunk_size_explicit
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
-    if not wing:
-        from .config import normalize_wing_name
-
-        wing = normalize_wing_name(convo_path.name)
+    wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
     if limit > 0:
@@ -549,7 +643,7 @@ def mine_convos(
         if extract_mode == "general":
             from .general_extractor import extract_memories
 
-            chunks = extract_memories(content)
+            chunks = extract_memories(content, chunk_size=cfg_chunk_size)
             # Each chunk already has memory_type; use it as the room name
         else:
             chunks = chunk_exchanges(
@@ -603,6 +697,9 @@ def mine_convos(
 
         total_drawers += drawers_added
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+
+    if not dry_run:
+        _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
     print("  Done.")

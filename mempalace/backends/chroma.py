@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as _dt
+import json
 import logging
 import os
 import pickle
@@ -665,6 +666,7 @@ def _pin_hnsw_threads(collection) -> None:
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
+_COLLECTION_TYPE_MARKER = ".collection_type_fixed"
 
 
 def _valid_dimensionality(value: object) -> bool:
@@ -877,6 +879,69 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     # Write marker whether or not rows needed migration — the palace is now
     # confirmed to be in the INTEGER-seq_id state and future opens can skip the
     # sqlite3.connect() entirely.
+    try:
+        Path(marker).touch()
+    except OSError:
+        logger.exception("Could not write migration marker %s", marker)
+
+
+def _fix_missing_collection_type(palace_path: str) -> None:
+    """Add ``_type`` to ``collections.config_json_str`` where absent.
+
+    chromadb <= 1.5.8 writes ``config_json_str = '{}'`` (empty JSON) when
+    creating collections.  chromadb 1.5.9 switched from the permissive
+    ``load_collection_configuration_from_json_str`` to
+    ``CollectionConfigurationInternal.from_json`` which requires a ``_type``
+    key — its absence raises ``KeyError: '_type'`` on palace open.
+
+    This migration adds the missing marker so both old and new chromadb
+    versions can load the collection.  The value
+    ``"CollectionConfigurationInternal"`` matches what ``to_json()`` writes
+    for freshly-created collections.
+
+    Same lifecycle constraints as :func:`_fix_blob_seq_ids`: must run
+    BEFORE ``PersistentClient`` is created.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return
+    marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
+    if os.path.isfile(marker):
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            rows = conn.execute("SELECT id, config_json_str FROM collections").fetchall()
+        except sqlite3.OperationalError:
+            return
+        updates = []
+        for coll_id, config_str in rows:
+            if not config_str:
+                config_str = "{}"
+            try:
+                config = json.loads(config_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            if "_type" not in config:
+                config["_type"] = "CollectionConfigurationInternal"
+                updates.append((json.dumps(config), coll_id))
+        if updates:
+            conn.executemany(
+                "UPDATE collections SET config_json_str = ? WHERE id = ?",
+                updates,
+            )
+            conn.commit()
+            logger.info(
+                "Fixed %d collection(s) missing _type in config_json_str",
+                len(updates),
+            )
+    except Exception:
+        logger.exception("Could not fix collection config_json_str in %s", db_path)
+        return
+    finally:
+        conn.close()
     try:
         Path(marker).touch()
     except OSError:
@@ -1227,6 +1292,38 @@ class ChromaBackend(BaseBackend):
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
 
+    @staticmethod
+    def _explain_ef_mismatch(error: Exception, palace_path: str) -> Optional[str]:
+        """If ``error`` looks like a ChromaDB EF-name mismatch, return a
+        user-friendly explanation. Otherwise return None so the caller can
+        re-raise unchanged.
+
+        Triggered when ``MEMPALACE_EMBEDDING_MODEL`` is switched on an
+        existing palace — ChromaDB persists the EF name on the collection
+        and refuses reads with a different one. The bare ValueError
+        ChromaDB raises doesn't mention rebuild-index or the env var, so
+        users hit it and don't know how to recover.
+        """
+        msg = str(error)
+        if "Embedding function conflict" not in msg and "embedding function" not in msg.lower():
+            return None
+        try:
+            from ..config import MempalaceConfig
+
+            current_model = MempalaceConfig().embedding_model
+        except Exception:
+            current_model = "unknown"
+        return (
+            f"Embedding model mismatch reading palace at {palace_path!r}.\n"
+            f"  Underlying ChromaDB error: {msg}\n"
+            f"  Current MEMPALACE_EMBEDDING_MODEL={current_model!r}.\n"
+            f"  The palace was built with a different embedding model. Either:\n"
+            f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
+            f"the previous value), or\n"
+            f"    (b) re-embed in place: `mempalace repair rebuild-index "
+            f"--palace {palace_path}` (writes new vectors with the current model)."
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1334,15 +1431,18 @@ class ChromaBackend(BaseBackend):
         """Run the pre-open safety pass shared by :meth:`make_client` and
         :meth:`_client`.
 
-        Three steps, all required before constructing a ``PersistentClient``:
+        Four steps, all required before constructing a ``PersistentClient``:
 
-        1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
+        1. ``_fix_missing_collection_type`` — adds the ``_type`` marker to
+           ``collections.config_json_str`` that chromadb 1.5.9+ requires
+           but <= 1.5.8 never wrote (#1611).
+        2. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
            certain chromadb migrations.
-        2. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
+        3. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
            ``index_metadata.pickle`` that fails to load, so chromadb opens
            against an empty index instead of crashing on the unloadable
            pickle (#1266 / PR #1285).
-        3. ``quarantine_stale_hnsw`` — also gated by :attr:`_quarantined_paths`
+        4. ``quarantine_stale_hnsw`` — also gated by :attr:`_quarantined_paths`
            so it fires once per palace per process. This is the SIGSEGV
            prevention path for stale HNSW segments (see #1121, #1132, #1263);
            wiring it through this helper means CLI mining, search, repair,
@@ -1353,6 +1453,7 @@ class ChromaBackend(BaseBackend):
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
+        _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
             quarantine_invalid_hnsw_metadata(palace_path)
@@ -1361,7 +1462,7 @@ class ChromaBackend(BaseBackend):
 
     @staticmethod
     def make_client(palace_path: str):
-        """Create a fresh ``PersistentClient`` (fixes BLOB seq_ids first).
+        """Create a fresh ``PersistentClient`` (runs pre-open safety pass first).
 
         Deprecated-ish: exposed for legacy long-lived callers that manage their
         own client cache. New code should obtain a collection through
@@ -1434,11 +1535,21 @@ class ChromaBackend(BaseBackend):
                     },
                     **ef_kwargs,
                 )
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         else:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
             except _ChromaNotFoundError as e:
                 raise CollectionNotInitializedError(palace_path) from e
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 

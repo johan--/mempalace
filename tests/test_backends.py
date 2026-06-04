@@ -23,6 +23,7 @@ from mempalace.backends.chroma import (
     ChromaCollection,
     _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
+    _fix_missing_collection_type,
     _pin_hnsw_threads,
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
@@ -612,6 +613,186 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
         _fix_blob_seq_ids(str(tmp_path))
 
     mock_connect.assert_not_called()
+
+
+# ── _fix_missing_collection_type ─────────────────────────────────────────
+
+
+def test_fix_collection_type_adds_type(tmp_path):
+    """Legacy config_json_str '{}' gets _type added."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", "{}"),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT config_json_str FROM collections WHERE id = 'col-1'").fetchone()
+        config = json.loads(row[0])
+        assert config["_type"] == "CollectionConfigurationInternal"
+
+
+def test_fix_collection_type_preserves_existing(tmp_path):
+    """Config that already has _type is left unchanged."""
+    import json
+
+    original = json.dumps({"_type": "CollectionConfigurationInternal", "extra": 1})
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", original),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT config_json_str FROM collections WHERE id = 'col-1'").fetchone()
+        assert row[0] == original
+
+
+def test_fix_collection_type_noop_without_db(tmp_path):
+    """No error when palace has no chroma.sqlite3, no marker written."""
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    _fix_missing_collection_type(str(tmp_path))
+    assert not (tmp_path / _COLLECTION_TYPE_MARKER).exists()
+
+
+def test_fix_collection_type_writes_marker(tmp_path):
+    """Marker is written after a successful migration."""
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", "{}"),
+        )
+        conn.commit()
+
+    marker = tmp_path / _COLLECTION_TYPE_MARKER
+    assert not marker.exists()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    assert marker.is_file()
+
+
+def test_fix_collection_type_skips_with_marker(tmp_path):
+    """When the marker exists, sqlite3 is not opened."""
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    db_path.write_bytes(b"sentinel")
+    (tmp_path / _COLLECTION_TYPE_MARKER).touch()
+
+    with patch("mempalace.backends.chroma.sqlite3.connect") as mock_connect:
+        _fix_missing_collection_type(str(tmp_path))
+
+    mock_connect.assert_not_called()
+
+
+def test_fix_collection_type_writes_marker_when_already_has_type(tmp_path):
+    """Marker written even when all collections already have _type (noop case)."""
+    import json
+
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", json.dumps({"_type": "CollectionConfigurationInternal"})),
+        )
+        conn.commit()
+
+    marker = tmp_path / _COLLECTION_TYPE_MARKER
+    assert not marker.exists()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    assert marker.is_file(), "marker must be written even when no collections needed fixing"
+
+
+def test_fix_collection_type_multi_collection_mixed(tmp_path):
+    """Multiple collections: NULL, empty, and already-valid configs."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-null", None))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-empty", "{}"))
+        conn.execute(
+            "INSERT INTO collections VALUES (?, ?)",
+            ("col-ok", json.dumps({"_type": "CollectionConfigurationInternal"})),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = {
+            r[0]: json.loads(r[1]) if r[1] else None
+            for r in conn.execute("SELECT id, config_json_str FROM collections")
+        }
+    assert rows["col-null"]["_type"] == "CollectionConfigurationInternal"
+    assert rows["col-empty"]["_type"] == "CollectionConfigurationInternal"
+    assert rows["col-ok"] == {"_type": "CollectionConfigurationInternal"}
+
+
+def test_fix_collection_type_skips_non_dict_json(tmp_path):
+    """Non-dict JSON (array, null literal) is skipped without error."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-arr", "[]"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-null", "null"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-ok", "{}"))
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = dict(conn.execute("SELECT id, config_json_str FROM collections").fetchall())
+    assert rows["col-arr"] == "[]"
+    assert rows["col-null"] == "null"
+    assert json.loads(rows["col-ok"])["_type"] == "CollectionConfigurationInternal"
+
+
+def test_fix_collection_type_skips_malformed_json(tmp_path):
+    """Malformed JSON in one row does not prevent fixing other rows."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-bad", "{corrupt"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-ok", "{}"))
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = dict(conn.execute("SELECT id, config_json_str FROM collections").fetchall())
+    assert rows["col-bad"] == "{corrupt"
+    assert json.loads(rows["col-ok"])["_type"] == "CollectionConfigurationInternal"
 
 
 # ── quarantine_stale_hnsw ─────────────────────────────────────────────────
@@ -1218,6 +1399,9 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
 
         return inner
 
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1235,6 +1419,7 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
@@ -1255,6 +1440,9 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
         return inner
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1276,9 +1464,11 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
     ]
 
@@ -1297,6 +1487,9 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         return inner
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1318,13 +1511,74 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+
+
+def test_explain_ef_mismatch_recognizes_chromadb_conflict():
+    """When ChromaDB rejects a collection read due to an EF-name mismatch
+    (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the
+    backend wraps the bare ValueError with a message that tells the user
+    how to recover. Without this, users hit a stack trace and don't know
+    rebuild-index exists."""
+    err = ValueError(
+        "An embedding function already exists in the collection configuration, "
+        "and a new one is provided. Embedding function conflict: new: "
+        "embeddinggemma_300m vs persisted: default"
+    )
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert msg is not None
+    assert "/tmp/palace.db" in msg
+    assert "MEMPALACE_EMBEDDING_MODEL" in msg
+    assert "rebuild-index" in msg
+
+
+def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
+    """Don't paper over unrelated ValueErrors with the EF-mismatch message —
+    the caller needs to re-raise unmodified so debugging stays sane."""
+    err = ValueError("Some other ChromaDB problem")
+    assert ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db") is None
+
+
+def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
+    """End-to-end: create a palace with the default EF, then try to read it
+    with a different EF name and confirm we surface the rebuild-index hint."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+
+    # Create the collection using the default (minilm-based) EF.
+    coll = backend.get_collection(palace_path, "drawers", create=True)
+    coll.add(documents=["seed"], ids=["1"])
+
+    # Now swap in an incompatible EF name (simulates the user setting
+    # MEMPALACE_EMBEDDING_MODEL=embeddinggemma without rebuild-index).
+    class _ConflictingEF:
+        @staticmethod
+        def name() -> str:
+            return "embeddinggemma_300m"
+
+        def __call__(self, input):
+            return [[0.0] * 384 for _ in input]
+
+    original_resolver = backend._resolve_embedding_function
+    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    # Drop the cached client so the next call goes through the open path.
+    backend.close_palace(palace_path)
+
+    try:
+        with pytest.raises(ValueError, match=r"rebuild-index"):
+            backend.get_collection(palace_path, "drawers", create=False)
+    finally:
+        backend._resolve_embedding_function = original_resolver
+        backend.close_palace(palace_path)
 
 
 def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
